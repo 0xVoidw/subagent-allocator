@@ -13,7 +13,10 @@ REQUIRED_SECTIONS = ("总览", "执行阶段", "角色卡", "假设与注意事�
 REQUIRED_TABLE_COLUMNS = ("任务", "档位", "模型", "effort")
 REQUIRED_CARD_FIELDS = ("角色", "目标", "输入", "约束", "完成标准", "返回格式", "升级阶梯")
 VALID_TIERS = ("T0", "T1", "T2", "T3")
-PLATFORM_RE = re.compile(r"平台[：:]\s*(claude|codex|both)", re.IGNORECASE)
+PLATFORM_RE = re.compile(
+    r"^来源[：:].*?平台[：:]\s*(claude|codex|both)(?=\s|$)",
+    re.MULTILINE | re.IGNORECASE,
+)
 REFERENCE_DIR = Path(__file__).resolve().parent.parent / "skills" / "subagent-allocator" / "references"
 
 
@@ -41,7 +44,7 @@ def parse_table(section_lines):
     for line in section_lines:
         stripped = line.strip()
         if not stripped.startswith("|"):
-            if header is not None and rows is not None:
+            if header is not None:
                 break
             continue
         cells = [cell.strip() for cell in stripped.strip("|").split("|")]
@@ -54,19 +57,61 @@ def parse_table(section_lines):
     return header, rows
 
 
-def load_reference_text(platform, errors):
-    files = []
-    if platform in (None, "claude", "both"):
-        files.append(REFERENCE_DIR / "claude.md")
-    if platform in (None, "codex", "both"):
-        files.append(REFERENCE_DIR / "codex.md")
-    texts = []
-    for path in files:
+def normalize_model(value):
+    value = value.replace("`", "").replace("*", "")
+    value = re.sub(r"\s+", " ", value).strip()
+    return value.casefold()
+
+
+def parse_documented_models(path):
+    """从参考文件的“档位 → 模型”表中提取模型名。"""
+    names = set()
+    header = None
+    model_indexes = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        if not stripped.startswith("|"):
+            header = None
+            model_indexes = []
+            continue
+        cells = [cell.strip() for cell in stripped.strip("|").split("|")]
+        if header is None:
+            if "模型" in cells:
+                header = cells
+                model_indexes = [
+                    index for index, cell in enumerate(cells) if cell in ("模型", "模型 ID")
+                ]
+                if not model_indexes:
+                    header = None
+            continue
+        if all(re.fullmatch(r":?-{3,}:?", cell) for cell in cells if cell):
+            continue
+        for index in model_indexes:
+            if index >= len(cells):
+                continue
+            cleaned = cells[index].replace("`", "").replace("*", "").strip()
+            if cleaned and cleaned not in ("—", "-", "无"):
+                names.add(normalize_model(cleaned))
+    return names
+
+
+def load_documented_models(platform, errors):
+    if platform == "both":
+        paths = [REFERENCE_DIR / "claude.md", REFERENCE_DIR / "codex.md"]
+    elif platform == "claude":
+        paths = [REFERENCE_DIR / "claude.md"]
+    else:
+        paths = [REFERENCE_DIR / "codex.md"]
+
+    names = set()
+    for path in paths:
         if not path.is_file():
             errors.append("找不到参考文件：%s" % path)
             continue
-        texts.append(path.read_text(encoding="utf-8"))
-    return "\n".join(texts)
+        names |= parse_documented_models(path)
+    if not names:
+        errors.append("无法从参考文件中解析出任何模型名")
+    return names
 
 
 def main(argv):
@@ -109,27 +154,35 @@ def main(argv):
     total_tasks = 0
     t3_tasks = 0
     if header is not None:
-        try:
-            tier_index = header.index("档位")
-            model_index = header.index("模型")
-        except ValueError:
-            tier_index = model_index = None
+        tier_index = header.index("档位") if "档位" in header else None
+        model_index = header.index("模型") if "模型" in header else None
 
         platform_match = PLATFORM_RE.search(text)
-        platform = platform_match.group(1).lower() if platform_match else None
-        reference_text = load_reference_text(platform, errors)
+        documented_models = set()
+        if platform_match is None:
+            errors.append("找不到合法的平台声明（应在“来源”行写明 平台：claude / codex / both）")
+        else:
+            platform = platform_match.group(1).lower()
+            documented_models = load_documented_models(platform, errors)
 
         for row_number, cells in enumerate(rows, start=1):
             if len(cells) != len(header):
                 errors.append("总览表第 %d 行数据列的个数与表头不一致" % row_number)
                 continue
             total_tasks += 1
-            tier = cells[tier_index]
-            if tier not in VALID_TIERS:
-                errors.append("总览表第 %d 行的档位取值非法：%r（只允许 T0/T1/T2/T3）" % (row_number, tier))
-            if tier == "T3":
-                t3_tasks += 1
 
+            if tier_index is not None:
+                tier = cells[tier_index]
+                if tier not in VALID_TIERS:
+                    errors.append(
+                        "总览表第 %d 行的档位取值非法：%r（只允许 T0/T1/T2/T3）"
+                        % (row_number, tier)
+                    )
+                if tier == "T3":
+                    t3_tasks += 1
+
+            if model_index is None:
+                continue
             model_cell = cells[model_index]
             if model_cell in ("", "—", "-", "无"):
                 continue
@@ -137,9 +190,10 @@ def main(argv):
                 model = model.strip()
                 if not model:
                     continue
-                if reference_text and model not in reference_text:
+                if documented_models and normalize_model(model) not in documented_models:
                     errors.append(
-                        "总览表第 %d 行的模型名 %r 在对应平台的参考文件中找不到" % (row_number, model)
+                        "总览表第 %d 行的模型名 %r 不是参考文件中记录的模型名"
+                        % (row_number, model)
                     )
 
     if total_tasks == 0:

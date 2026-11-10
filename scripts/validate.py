@@ -13,6 +13,8 @@ from pathlib import Path
 DEFAULT_SKILL_DIR = Path("skills/subagent-allocator")
 FRONTMATTER_NAME_RE = re.compile(r"^[a-z0-9-]+$")
 REFERENCE_PATH_RE = re.compile(r"references/[A-Za-z0-9._/-]+\.md")
+REFERENCE_TOKEN_RE = re.compile(r"references/[A-Za-z0-9._/-]+")
+TRAILING_PUNCTUATION = ".,;:!?，。；：！？"
 UPGRADE_HEADING_RE = re.compile(r"^#{1,6}\s*升级阶梯\s*$", re.MULTILINE)
 REQUIRED_KEYS = ("name", "description")
 REQUIRED_TIERS = ("T0", "T1", "T2", "T3")
@@ -21,11 +23,11 @@ REQUIRED_TIERS = ("T0", "T1", "T2", "T3")
 def parse_frontmatter(text):
     """返回 (frontmatter 字典, 正文行列表)。格式不完整时返回 (None, None)。"""
     lines = text.splitlines()
-    if not lines or lines[0].strip() != "---":
+    if not lines or lines[0].rstrip() != "---":
         return None, None
     closing = None
     for index in range(1, len(lines)):
-        if lines[index].strip() == "---":
+        if lines[index].rstrip() == "---":
             closing = index
             break
     if closing is None:
@@ -35,13 +37,28 @@ def parse_frontmatter(text):
     for line in lines[1:closing]:
         if not line.strip() or line.lstrip().startswith("#"):
             continue
+        if line[0].isspace():
+            # 缩进行是嵌套键，不属于顶层 frontmatter
+            continue
         if ":" not in line:
             continue
         key, value = line.split(":", 1)
         key = key.strip()
-        if key:
-            frontmatter[key] = value.strip()
+        if not key:
+            continue
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+            value = value[1:-1]
+        frontmatter[key] = value
     return frontmatter, lines[closing + 1:]
+
+
+def mentioned_reference_paths(text):
+    """从 SKILL.md 中提取被提及的 references 路径，去掉行尾标点。"""
+    paths = set()
+    for token in REFERENCE_TOKEN_RE.findall(text):
+        paths.add(token.rstrip(TRAILING_PUNCTUATION))
+    return paths
 
 
 def check_frontmatter(skill_dir, text, errors):
@@ -87,9 +104,10 @@ def check_references(skill_dir, text, errors):
     )
     if not reference_files:
         errors.append("references/ 目录为空")
+    mentioned = mentioned_reference_paths(text)
     for path in reference_files:
         relative = path.relative_to(skill_dir).as_posix()
-        if relative not in text:
+        if relative not in mentioned:
             errors.append("references/ 下的文件未在 SKILL.md 中提及：%s" % relative)
 
 
